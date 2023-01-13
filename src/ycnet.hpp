@@ -21,20 +21,26 @@ namespace ycnet
         YC_USE int thread_id;
     };
 
-
     // 하지만 해제가 느려진다면, io처리를 할 때 block 될 수도 있다. 
     // 다만 특정 io thread 에 들어오는 packet 이 많다면 send 속도가 느려질 수 있다.
     // 나중에 core 부분도 인덱스 버퍼를 사용하는 방식으로 최적화 해야 한다.
 
+    template <size_t ThreadCount>
+    void release_buf(nto_memory<raw_packet_t, ThreadCount>& mem, raw_packet_t* buf) { mem.read_end(buf); }
 
     template <size_t ThreadCount>
-    void release_buf(nto_memory<ycnet::raw_packet_t, ThreadCount>& mem, ycnet::raw_packet_t* buf) { mem.read_end(buf); }
-
-    template <size_t ThreadCount>
-    std::vector<ycnet::raw_packet_t*> get_pkt_range(nto_memory<ycnet::raw_packet_t, ThreadCount>& mem) {
+    std::vector<raw_packet_t*> get_pkt_range(nto_memory<raw_packet_t, ThreadCount>& mem) {
         return mem.get_read_ranges();
     }
 
+    packet_ack_type make_ack_pkt(int seq) {
+        yc_pack::udp::convert_ack seq_packet(seq);
+        seq_packet.is_ack_packet = true;
+        seq_packet.use_ack = true;
+        seq_packet.counter = seq;
+        return seq_packet.to_ack();
+    }
+    
     constexpr int max_client = 100;
     constexpr int io_thread = 4;
 
@@ -43,13 +49,33 @@ namespace ycnet
         std::vector<yc_rudp::receive_packet_raw> no_ack_buffs_;
         int rtts_;
         int seq_;
+        int send_seq_;
         int end_;
+        std::function<void(char*, size_t)> send_func_;
         std::function<void(std::string)> log_func_;
+        char send_packet_build_buff_[1024] = {};
+        
+        void send_ack(const int seq, const int thread_num = 0) const {
+            char pkt = make_ack_pkt(seq);
+            send_func_(&pkt, 1);
+        }
 
+        int build_send_buffer(char* target_buf, const yc_pack::raw_packet& pkt_data) const {
+            *reinterpret_cast<packet_size_type*>(target_buf) = pkt_data.size;
+            *reinterpret_cast<packet_id_type*>(target_buf + sizeof packet_size_type) = pkt_data.id;
+            std::copy_n(pkt_data.body, pkt_data.size - yc_pack::HEADER_SIZE, target_buf + yc_pack::HEADER_SIZE);
+            return pkt_data.size;
+        }
     public:
-        explicit rudp_handler(std::function<void(std::string)> log_func) : rudp_buffs_(1)
-                                                                           , rtts_(100), seq_(0), end_(0),
-                                                                           log_func_(std::move(log_func)) { }
+        explicit rudp_handler(std::function<void(std::string)> log_func,
+                              std::function<void(char*, size_t)> send_func)
+        : rudp_buffs_(1)
+        , rtts_(100)
+        , seq_(0)
+        , send_seq_(0)
+        , end_(0)
+        , send_func_(std::move(send_func))
+        , log_func_(std::move(log_func)) { }
 
         void recv(char* buf, size_t len) {
             if (yc_rudp::is_ack_packet(buf)) {
@@ -66,6 +92,7 @@ namespace ycnet
             auto [s,e] = get_read_range(rudp_buffs_.pkt_buffer, rudp_buffs_.receive_buffer, no_ack_buffs_, 1, end_);
             for (; s < e; ++s) {
                 yc_rudp::make_seq(s);
+                send_ack(yc_rudp::make_seq(s));
                 auto [size, pid, body] = yc_pack::unpack(rudp_buffs_.receive_buffer[yc_rudp::make_seq(s)].data);
                 packet_events[pid](body, size, 0);
             }
@@ -76,6 +103,32 @@ namespace ycnet
                 packet_events[pid](body, size, 0);
             }
             no_ack_buffs_.clear();
+        }
+
+        void send(is_ack_packet auto& packet) {
+            auto pkt = yc_pack::pack(packet);
+            auto size = build_send_buffer(send_packet_build_buff_, pkt);
+            const auto seq = yc_rudp::ready_to_send(rudp_buffs_.send_buffer, send_packet_build_buff_, size, true, send_seq_);
+            auto& send_buf = rudp_buffs_.send_buffer[seq];
+            send_func_(send_buf.data, send_buf.len);
+            send_seq_ = yc_rudp::get_next_seq(send_seq_);
+        }
+
+        void send(is_no_ack_packet auto& packet) {
+            auto pkt = yc_pack::pack(packet);
+            auto size = build_send_buffer(send_packet_build_buff_, pkt);
+            const auto seq = yc_rudp::ready_to_send(rudp_buffs_.send_buffer, send_packet_build_buff_, size, false, 0);
+            auto& send_buf = rudp_buffs_.send_buffer[seq];
+            send_func_(send_buf.data, send_buf.len);
+        }
+
+        void prc_resend() {
+            auto r = yc_rudp::get_resend_packets(rudp_buffs_.send_buffer, rtts_, 1000);
+            for(auto& i : r) {
+                log_func_(std::format("resend to {}", i));
+                auto& pkt = rudp_buffs_.send_buffer[i];
+                send_func_(pkt.data, pkt.len);
+            }
         }
     };
 
@@ -93,6 +146,7 @@ namespace ycnet
         std::vector<int> rtts_;
         std::vector<int> seq_;
         std::vector<int> end_;
+        std::vector<int> send_seq_;
 
         // 극한의 퍼포먼스를 위해서는 Main Thread 에서 할당 해제된 패킷을 다시 반환하는 작업이 필요하다.
         // worker thread 에서 패킷 처리를 실행한다면 main thread 에게 사용한 패킷을 반납하는 절차가 필요하다.
@@ -103,12 +157,15 @@ namespace ycnet
             if (!ids_.contains(ep)) return "user not found";
             return yc::err_opt_t(ids_[ep]);
         }
-
+        void send_ack(const size_t& id, const int seq, const int thread_num = 0) {
+            char pkt = make_ack_pkt(seq);
+            core::send_udp(&pkt, 1, endpoints_[id], thread_num);
+        }
         void prc_pkt(const size_t& id) {
             auto [s,e] = get_read_range(rudp_buffs_[id].pkt_buffer, rudp_buffs_[id].receive_buffer, no_ack_buffs_[id],
                                         1, end_[id]);
             for (; s < e; ++s) {
-                yc_rudp::make_seq(s);
+                send_ack(id, yc_rudp::make_seq(s));
                 auto [size, pid, body] = yc_pack::unpack(rudp_buffs_[id].receive_buffer[yc_rudp::make_seq(s)].data);
                 packet_events[pid](body, size, id);
             }
@@ -120,13 +177,19 @@ namespace ycnet
             }
             no_ack_buffs_[id].clear();
         }
-
+        int build_send_buffer(char* target_buf, const yc_pack::raw_packet& pkt_data) const {
+            *reinterpret_cast<packet_size_type*>(target_buf) = pkt_data.size;
+            *reinterpret_cast<packet_id_type*>(target_buf + sizeof packet_size_type) = pkt_data.id;
+            std::copy_n(pkt_data.body, pkt_data.size - yc_pack::HEADER_SIZE, target_buf + yc_pack::HEADER_SIZE);
+            return pkt_data.size;
+        }
     public:
         explicit server(std::function<void(std::string)> log_func): endpoints_(max_client)
                                                                     , no_ack_buffs_(max_client)
                                                                     , rtts_(max_client)
                                                                     , seq_(max_client)
                                                                     , end_(max_client)
+                                                                    , send_seq_(max_client)
                                                                     , log_func_(std::move(log_func)) {
             for (int i = max_client - 1; i >= 0; --i) id_index_q_.push_back(i);
             rudp_buffs_.reserve(max_client);
@@ -175,6 +238,34 @@ namespace ycnet
             std::ranges::for_each(packets | std::views::keys, [this](const auto& i) { prc_pkt(i); });
         }
 
+        void send(is_ack_packet auto& packet, const size_t& id, const int thread_num = 0) {
+            auto pkt = yc_pack::pack(packet);
+            char buf[1024] = {};
+            auto size = build_send_buffer(buf, pkt);
+            const auto seq = yc_rudp::ready_to_send(rudp_buffs_[id].send_buffer, buf, size, true, send_seq_[id]);
+            auto& send_buf = rudp_buffs_[id].send_buffer[seq];
+            core::send_udp(send_buf.data, send_buf.len, endpoints_[id], thread_num);
+            send_seq_[id] = yc_rudp::get_next_seq(send_seq_[id]);
+        }
+
+        void send(is_no_ack_packet auto& packet, const size_t& id, const int thread_num = 0) {
+            auto pkt = yc_pack::pack(packet);
+            char buf[1024] = {};
+            auto size = build_send_buffer(buf, pkt);
+            const auto seq = yc_rudp::ready_to_send(rudp_buffs_[id].send_buffer, buf, size, false, 0);
+            auto& send_buf = rudp_buffs_[id].send_buffer[seq];
+            core::send_udp(send_buf.data, send_buf.len, endpoints_[id], thread_num);
+        }
+
+        void prc_resend(const size_t& id, const int thread_num = 0) {
+            auto r = yc_rudp::get_resend_packets(rudp_buffs_[id].send_buffer, rtts_[id], 1000);
+            for(auto& i : r) {
+                log_func_(std::format("resend to {}", id));
+                auto& pkt = rudp_buffs_[id].send_buffer[i];
+                core::send_udp(pkt.data, pkt.len, endpoints_[id], thread_num);
+            }
+        }
+        
         void run() {
             // ReSharper disable once CppTooWideScope
             const auto r = ycnet::core::udp_server_run(
@@ -182,7 +273,7 @@ namespace ycnet
                 12345,
                 [this](const char* data, const int size, const ycnet::core::endpoint_t& endpoint, const int thread_id) {
                     ycnet::raw_packet_t* packet = nullptr;
-                    while (packets_buffer_.try_push(thread_id, packet)) {
+                    while (!packets_buffer_.try_push(thread_id, packet)) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
                     std::copy_n(data, size, packet->buf);
