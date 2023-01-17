@@ -21,10 +21,6 @@ namespace ycnet
         YC_USE int thread_id;
     };
 
-    // 하지만 해제가 느려진다면, io처리를 할 때 block 될 수도 있다. 
-    // 다만 특정 io thread 에 들어오는 packet 이 많다면 send 속도가 느려질 수 있다.
-    // 나중에 core 부분도 인덱스 버퍼를 사용하는 방식으로 최적화 해야 한다.
-
     template <size_t ThreadCount>
     void release_buf(nto_memory<raw_packet_t, ThreadCount>& mem, raw_packet_t* buf) { mem.read_end(buf); }
 
@@ -33,20 +29,21 @@ namespace ycnet
         return mem.get_read_ranges();
     }
 
-    packet_ack_type make_ack_pkt(int seq) {
-        yc_pack::udp::convert_ack seq_packet(seq);
+    inline packet_ack_type make_ack_pkt(const int seq) {
+        yc_pack::udp::convert_ack seq_packet;
         seq_packet.is_ack_packet = true;
         seq_packet.use_ack = true;
         seq_packet.counter = seq;
         return seq_packet.to_ack();
     }
     
-    constexpr int max_client = 100;
-    constexpr int io_thread = 4;
-
+    // ReSharper disable once IdentifierTypo
     class rudp_handler {
+        // ReSharper disable once IdentifierTypo
         yc_rudp::rudp_buffer_t rudp_buffs_;
+        std::vector<int> resend_buff_;
         std::vector<yc_rudp::receive_packet_raw> no_ack_buffs_;
+        // ReSharper disable once IdentifierTypo
         int rtts_;
         int seq_;
         int send_seq_;
@@ -67,6 +64,7 @@ namespace ycnet
             return pkt_data.size;
         }
     public:
+        // ReSharper disable once IdentifierTypo
         explicit rudp_handler(std::function<void(std::string)> log_func,
                               std::function<void(char*, size_t)> send_func)
         : rudp_buffs_(1)
@@ -77,14 +75,18 @@ namespace ycnet
         , send_func_(std::move(send_func))
         , log_func_(std::move(log_func)) { }
 
-        void recv(char* buf, size_t len) {
+        // ReSharper disable once IdentifierTypo
+        void on_recv(char* buf, const size_t len) {
+            if(!yc_pack::pkt_vrfct(buf, len)) {
+                log_func_("packet verification failed");
+                return;
+            }
             if (yc_rudp::is_ack_packet(buf)) {
-                if (set_send_complete(rudp_buffs_.send_buffer, rtts_, yc_rudp::get_seq(buf)) == -1) {
+                if (set_send_complete(rudp_buffs_.send_buffer, resend_buff_, rtts_, yc_rudp::get_seq(buf)) == -1) {
                     log_func_("set_send_complete() error");
                 }
             }
             else {
-                // 최근에 처리한 seq 번호보다 뒤에 있는 패킷이 오면 컷 하자.
                 if (push_packet(rudp_buffs_.pkt_buffer, 0, 1, buf, len) == -1) {
                     log_func_(std::format("id : {} - push_packet failed!", "client_side"));
                 }
@@ -97,7 +99,6 @@ namespace ycnet
                 packet_events[pid](body, size, 0);
             }
             end_ = yc_rudp::make_seq(s);
-
             for (auto& [data, _] : no_ack_buffs_) {
                 auto [size, pid, body] = yc_pack::unpack(data);
                 packet_events[pid](body, size, 0);
@@ -105,15 +106,17 @@ namespace ycnet
             no_ack_buffs_.clear();
         }
 
+        // send packet
         void send(is_ack_packet auto& packet) {
             auto pkt = yc_pack::pack(packet);
             auto size = build_send_buffer(send_packet_build_buff_, pkt);
-            const auto seq = yc_rudp::ready_to_send(rudp_buffs_.send_buffer, send_packet_build_buff_, size, true, send_seq_);
+            const auto seq = yc_rudp::ready_to_send(rudp_buffs_.send_buffer, resend_buff_, send_packet_build_buff_, size, true, send_seq_);
             auto& send_buf = rudp_buffs_.send_buffer[seq];
             send_func_(send_buf.data, send_buf.len);
             send_seq_ = yc_rudp::get_next_seq(send_seq_);
         }
 
+        // send packet without ack
         void send(is_no_ack_packet auto& packet) {
             auto pkt = yc_pack::pack(packet);
             auto size = build_send_buffer(send_packet_build_buff_, pkt);
@@ -121,9 +124,10 @@ namespace ycnet
             auto& send_buf = rudp_buffs_.send_buffer[seq];
             send_func_(send_buf.data, send_buf.len);
         }
-
+        
+        //ack 패킷 수신에 실패 했을 경우 패킷을 재전송 합니다.
         void prc_resend() {
-            auto r = yc_rudp::get_resend_packets(rudp_buffs_.send_buffer, rtts_, 1000);
+            auto r = get_resend_packets(rudp_buffs_.send_buffer, resend_buff_, rtts_, 1000);
             for(auto& i : r) {
                 log_func_(std::format("resend to {}", i));
                 auto& pkt = rudp_buffs_.send_buffer[i];
@@ -132,34 +136,36 @@ namespace ycnet
         }
     };
 
-    class server {
-        nto_memory<ycnet::raw_packet_t, io_thread> packets_buffer_;
-        ycnet::core::rio_udp_server_controller server_controller_;
-        std::vector<ycnet::core::endpoint_t> endpoints_;
+    template <size_t MaxClient, size_t IoThreadCount, int Port = 51234>
+    // ReSharper disable once IdentifierTypo
+    class rudp_server {
+        nto_memory<raw_packet_t, IoThreadCount> packets_buffer_;
+        core::rio_udp_server_controller server_controller_;
+        std::vector<core::endpoint_t> endpoints_;
         // ReSharper disable once IdentifierTypo
-        std::unordered_map<ycnet::core::endpoint_t, size_t> ids_;
+        std::unordered_map<core::endpoint_t, size_t> ids_;
         std::vector<size_t> id_index_q_;
         // ReSharper disable once IdentifierTypo
         std::vector<yc_rudp::rudp_buffer_t> rudp_buffs_;
+        std::vector<std::vector<int>> resend_index_buffs_;
         std::vector<std::vector<yc_rudp::receive_packet_raw>> no_ack_buffs_;
         // ReSharper disable once IdentifierTypo
         std::vector<int> rtts_;
         std::vector<int> seq_;
         std::vector<int> end_;
         std::vector<int> send_seq_;
-
-        // 극한의 퍼포먼스를 위해서는 Main Thread 에서 할당 해제된 패킷을 다시 반환하는 작업이 필요하다.
-        // worker thread 에서 패킷 처리를 실행한다면 main thread 에게 사용한 패킷을 반납하는 절차가 필요하다.
-
         std::function<void(std::string)> log_func_;
-
-        yc::err_opt_t<size_t> get_user_id(const ycnet::core::endpoint_t& ep) {
+        std::function<void(core::endpoint_t, size_t)> time_out_;
+        std::function<void(core::endpoint_t, size_t)> connect_;
+        int time_out_rtt_;
+        
+        yc::err_opt_t<size_t> get_user_id(const core::endpoint_t& ep) {
             if (!ids_.contains(ep)) return "user not found";
             return yc::err_opt_t(ids_[ep]);
         }
-        void send_ack(const size_t& id, const int seq, const int thread_num = 0) {
-            char pkt = make_ack_pkt(seq);
-            core::send_udp(&pkt, 1, endpoints_[id], thread_num);
+        void send_ack(const size_t& id, const int seq, const int thread_num = 0) const {
+            const char pkt = make_ack_pkt(seq);
+            send_udp(&pkt, 1, endpoints_[id], thread_num);
         }
         void prc_pkt(const size_t& id) {
             auto [s,e] = get_read_range(rudp_buffs_[id].pkt_buffer, rudp_buffs_[id].receive_buffer, no_ack_buffs_[id],
@@ -183,24 +189,46 @@ namespace ycnet
             std::copy_n(pkt_data.body, pkt_data.size - yc_pack::HEADER_SIZE, target_buf + yc_pack::HEADER_SIZE);
             return pkt_data.size;
         }
+        bool reset_connection(const size_t& id) {
+            rtts_[id] = 100;
+            seq_[id] = 0;
+            end_[id] = 0;
+            send_seq_[id] = 0;
+            id_index_q_.push_back(id);
+            resend_index_buffs_[id].clear();
+            rudp_buffs_[id].clear();
+            return true;
+        }
+
     public:
-        explicit server(std::function<void(std::string)> log_func): endpoints_(max_client)
-                                                                    , no_ack_buffs_(max_client)
-                                                                    , rtts_(max_client)
-                                                                    , seq_(max_client)
-                                                                    , end_(max_client)
-                                                                    , send_seq_(max_client)
-                                                                    , log_func_(std::move(log_func)) {
-            for (int i = max_client - 1; i >= 0; --i) id_index_q_.push_back(i);
-            rudp_buffs_.reserve(max_client);
-            for (int i = 0; i < max_client; ++i) { rudp_buffs_.emplace_back(1); }
+        // ReSharper disable once IdentifierTypo
+        explicit rudp_server(std::function<void(std::string)> log_func): endpoints_(MaxClient)
+                                                                         , resend_index_buffs_(MaxClient)
+                                                                         , no_ack_buffs_(MaxClient)
+                                                                         , rtts_(MaxClient)
+                                                                         , seq_(MaxClient)
+                                                                         , end_(MaxClient)
+                                                                         , send_seq_(MaxClient)
+                                                                         , log_func_(std::move(log_func))
+                                                                         , time_out_rtt_(1000) {
+            for (int i = MaxClient - 1; i >= 0; --i) id_index_q_.push_back(i);
+            rudp_buffs_.reserve(MaxClient);
+            for (size_t i = 0; i < MaxClient; ++i) resend_index_buffs_[i].reserve(32);
+            for (size_t i = 0; i < MaxClient; ++i) { rudp_buffs_.emplace_back(1); }
             log_func_("Server Started");
         }
 
+        void set_time_out_rtt(const int rtt) { time_out_rtt_ = rtt; }
+        void set_time_out_func(std::function<void(core::endpoint_t, size_t)> func) { time_out_ = std::move(func); }
+        void set_connect_func(std::function<void(core::endpoint_t, size_t)> func) { connect_ = std::move(func); }
+        
+        /**
+         * \brief packet을 읽어드립니다.
+         * 이 함수는 Thread Safe 하지 않습니다.
+         */
         // ReSharper disable once IdentifierTypo
         void intr_pkt() {
             std::unordered_map<size_t, int> packets;
-
             for (auto* i : get_pkt_range(packets_buffer_)) {
                 auto opt_id = get_user_id(i->ep);
                 size_t id = 0;
@@ -213,16 +241,15 @@ namespace ycnet
                     seq_[new_id] = 0;
                     end_[new_id] = 0;
                     id = new_id;
+                    connect_(i->ep, id);
                 }
                 else { id = *opt_id; }
-
                 if (yc_rudp::is_ack_packet(i->buf)) {
-                    if (set_send_complete(rudp_buffs_[id].send_buffer, rtts_[id], yc_rudp::get_seq(i->buf)) == -1) {
+                    if (set_send_complete(rudp_buffs_[id].send_buffer, resend_index_buffs_[id], rtts_[id], yc_rudp::get_seq(i->buf)) == -1) {
                         log_func_("set_send_complete() error");
                     }
                 }
                 else {
-                    // 최근에 처리한 seq 번호보다 뒤에 있는 패킷이 오면 컷 하자.
                     if (push_packet(rudp_buffs_[id].pkt_buffer, 0, 1, i->buf, i->len) == -1) {
                         log_func_(std::format("id : {} - push_packet failed!", id));
                     }
@@ -242,7 +269,7 @@ namespace ycnet
             auto pkt = yc_pack::pack(packet);
             char buf[1024] = {};
             auto size = build_send_buffer(buf, pkt);
-            const auto seq = yc_rudp::ready_to_send(rudp_buffs_[id].send_buffer, buf, size, true, send_seq_[id]);
+            const auto seq = yc_rudp::ready_to_send(rudp_buffs_[id].send_buffer, resend_index_buffs_[id], buf, size, true, send_seq_[id]);
             auto& send_buf = rudp_buffs_[id].send_buffer[seq];
             core::send_udp(send_buf.data, send_buf.len, endpoints_[id], thread_num);
             send_seq_[id] = yc_rudp::get_next_seq(send_seq_[id]);
@@ -252,27 +279,37 @@ namespace ycnet
             auto pkt = yc_pack::pack(packet);
             char buf[1024] = {};
             auto size = build_send_buffer(buf, pkt);
-            const auto seq = yc_rudp::ready_to_send(rudp_buffs_[id].send_buffer, buf, size, false, 0);
+            const auto seq = yc_rudp::ready_to_send(rudp_buffs_[id].send_buffer, resend_index_buffs_[id], buf, size, false, 0);
             auto& send_buf = rudp_buffs_[id].send_buffer[seq];
             core::send_udp(send_buf.data, send_buf.len, endpoints_[id], thread_num);
         }
 
         void prc_resend(const size_t& id, const int thread_num = 0) {
-            auto r = yc_rudp::get_resend_packets(rudp_buffs_[id].send_buffer, rtts_[id], 1000);
+            const auto r = get_resend_packets(rudp_buffs_[id].send_buffer, resend_index_buffs_[id], rtts_[id], 1000);
+            if(r.empty() && rtts_[id] == -1) {
+                time_out_(endpoints_[id], id);
+                reset_connection(id);
+                return;
+            }
             for(auto& i : r) {
                 log_func_(std::format("resend to {}", id));
-                auto& pkt = rudp_buffs_[id].send_buffer[i];
-                core::send_udp(pkt.data, pkt.len, endpoints_[id], thread_num);
+                const auto& pkt = rudp_buffs_[id].send_buffer[i];
+                send_udp(pkt.data, pkt.len, endpoints_[id], thread_num);
             }
         }
         
-        void run() {
+        void io_service_run() {
             // ReSharper disable once CppTooWideScope
-            const auto r = ycnet::core::udp_server_run(
-                4,
-                12345,
-                [this](const char* data, const int size, const ycnet::core::endpoint_t& endpoint, const int thread_id) {
-                    ycnet::raw_packet_t* packet = nullptr;
+            const auto r = core::udp_server_run(
+                IoThreadCount,
+                Port,
+                [this](const char* data, const int size, const core::endpoint_t& endpoint, const int thread_id) {
+                    log_func_(std::format("recv from {} - {}", endpoint.to_string(), size));
+                    if(!yc_pack::pkt_vrfct(const_cast<char*>(data), size)) {
+                        log_func_("packet verification failed");
+                        return;
+                    }
+                    raw_packet_t* packet = nullptr;
                     while (!packets_buffer_.try_push(thread_id, packet)) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
@@ -285,13 +322,13 @@ namespace ycnet
             if (r) server_controller_ = *r;
             else log_func_(r.err);
         }
-
+        
         /**
          * \brief Client 고유 ID를 가져온다. thread safe 하지 않습니다.
          * \param endpoint 가져올 클라이언트의 endpoint
          * \return endpoint 에 해당하는 ID
          */
-        yc::err_opt_t<size_t> user_id(const ycnet::core::endpoint_t& endpoint) {
+        yc::err_opt_t<size_t> user_id(const core::endpoint_t& endpoint) {
             return ids_.contains(endpoint)
                        ? yc::err_opt_t(ids_[endpoint])
                        : "해당 endpoint는 존재하지 않습니다.";

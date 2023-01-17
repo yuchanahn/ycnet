@@ -8,8 +8,9 @@ APACKET(
     char message[256];
 );
 
-//PACKET(player_movement_start, player_movement_start_t move_data;)
-//PACKET_VAR(players_location, player_movement_t, player_movements[50];);
-//PACKET_VAR(players_spawn, player_spawn_t, spawn_data[10];);
+APACKET_VAR(
+  chat_var,
+  char, message[512];
+);
 
 #pragma pack(pop)
